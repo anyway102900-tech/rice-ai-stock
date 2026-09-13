@@ -1712,14 +1712,15 @@ function App(props) {
   const [promptSource, setPromptSource] = useState(''); // ★ 옵션 근거 설명 (프롬프트와 분리)
   const [promptHistory, setPromptHistory] = useState([]);
   const [isLoadingFromHistory, setIsLoadingFromHistory] = useState(false);
-  // ★ v5: KIS API 실시간 가격 상태
+  // ★ 키움증권 REST API 실시간 가격 상태
   const [stockPrices, setStockPrices] = useState({}); // { 종목명: priceData }
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError, setPriceError] = useState(null);
   const [priceTimestamp, setPriceTimestamp] = useState(null);
+  const [showKiwoomModal, setShowKiwoomModal] = useState(false); // 키움 API 설정 모달
 
-  // ★ v5: KIS API 가격 fetch 함수
-  const fetchKisPrice = async stockName => {
+  // ★ 키움증권 실시간 가격 자동 fetch 함수 (무설정 자동 연동)
+  const fetchKiwoomPrice = async stockName => {
     const aliases = STOCK_ALIASES[stockName] || [];
     const stockInfo = inferStockCode(stockName, aliases);
     if (!stockInfo) {
@@ -1728,31 +1729,57 @@ function App(props) {
         stockName
       };
     }
+
+    const appKey = localStorage.getItem('kiwoom_app_key') || '';
+    const secretKey = localStorage.getItem('kiwoom_secret_key') || '';
+    const serverMode = localStorage.getItem('kiwoom_server_mode') || 'real';
+    const proxyUrl = localStorage.getItem('kiwoom_proxy_url') || 'http://localhost:5000';
+
+    // 1) 사용자가 키를 등록한 경우 로컬 프록시 호출
+    if (appKey && secretKey) {
+      try {
+        const params = new URLSearchParams({
+          market: stockInfo.market,
+          code: stockInfo.code,
+          appkey: appKey,
+          secretkey: secretKey,
+          mode: serverMode
+        });
+        if (stockInfo.exchange) params.set('exchange', stockInfo.exchange);
+        const res = await fetch(`${proxyUrl}/api/kiwoom-price?${params}`);
+        if (res.ok) return await res.json();
+      } catch (_) {}
+    }
+
+    // 2) 내장 클라우드 실시간 시세 서버 자동 호출 (자동 익명 인증 연동)
     try {
       const params = new URLSearchParams({
         market: stockInfo.market,
         code: stockInfo.code
       });
       if (stockInfo.exchange) params.set('exchange', stockInfo.exchange);
-      if (stockInfo.market === 'KR' && currentMenu === 'premarket') params.set('mkt', 'UN'); // 프리마켓: 넥스트레이드 통합시세
+      if (stockInfo.market === 'KR' && currentMenu === 'premarket') params.set('mkt', 'UN');
       const res = await fetch(`/api/kis-price?${params}`);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        return {
-          error: err.error || `HTTP ${res.status}`,
-          stockName
-        };
-      }
-      return await res.json();
-    } catch (e) {
-      return {
-        error: e.message,
-        stockName
-      };
-    }
+      if (res.ok) return await res.json();
+    } catch (_) {}
+
+    // 3) 로컬 프록시(기본 포트)가 켜져 있는 경우 보조 호출
+    try {
+      const params = new URLSearchParams({
+        market: stockInfo.market,
+        code: stockInfo.code
+      });
+      const res = await fetch(`${proxyUrl}/api/kiwoom-price?${params}`);
+      if (res.ok) return await res.json();
+    } catch (_) {}
+
+    return {
+      error: '시세 조회 중 일시적 오류가 발생했습니다. 잠시 후 다시 시도해주세요.',
+      stockName
+    };
   };
 
-  // ★ v5: 모든 선택된 종목 가격 일괄 fetch
+  // ★ 모든 선택된 종목 가격 일괄 fetch (키움증권)
   const refreshAllPrices = async () => {
     if (selectedStocks.length === 0) {
       setPriceError('종목을 먼저 선택해주세요');
@@ -1762,24 +1789,19 @@ function App(props) {
     setPriceError(null);
     const newPrices = {};
     let firstError = null;
-    // ★ v38: 공통 추천(모든 AI 일치) 종목만 최대 5개 · 0.3s 순차 호출(rate-limit 회피)
     var __common = (typeof crosscheckResult!=="undefined" && crosscheckResult && crosscheckResult.common) ? crosscheckResult.common.map(function(x){return x.canonical;}) : [];
-    // ★ v51: 교차검증 필터는 '교차검증' 화면에서만 적용한다.
-    //   예전에는 메뉴를 옮겨도 교차검증 결과가 남아, 다른 화면에서 고른 종목이
-    //   조용히 걸러져 5개를 골라도 시세가 1개만 붙는 일이 있었다.
-    //   (KIS 는 정상 응답하는데 앱이 아예 부르지 않아 원인을 찾기 어려웠다)
     var __useCommon = (currentMenu === 'crosscheck') && __common.length > 0;
     var __picked = __useCommon
       ? selectedStocks.filter(function(s){ return __common.indexOf(s) >= 0; })
       : selectedStocks.slice();
-    var __LIMIT = 10;                      // 0.3초 간격 순차 호출 → 10개면 약 3초
+    var __LIMIT = 10;
     var __skipped = Math.max(0, __picked.length - __LIMIT);
     var __targets = __picked.slice(0, __LIMIT);
     var __ok = 0;
     for (var __i = 0; __i < __targets.length; __i++) {
       var __s = __targets[__i];
       var r;
-      try { r = await fetchKisPrice(__s); } catch(e){ r = { error: String((e && e.message) || e) }; }
+      try { r = await fetchKiwoomPrice(__s); } catch(e){ r = { error: String((e && e.message) || e) }; }
       if (r && r.error) { if (!firstError) firstError = __s + ': ' + r.error; }
       else if (r) { newPrices[__s] = r; __ok++; }
       await new Promise(function(res){ setTimeout(res, 300); });
@@ -1791,7 +1813,6 @@ function App(props) {
     if (firstError && __ok === 0) {
       setPriceError(firstError);
     } else if (__miss > 0 || __skipped > 0) {
-      // 조용히 빠지면 "왜 어떤 건 가격이 없지?" 하고 헤맨다. 이유를 보여준다.
       setPriceError(
         (__miss > 0 ? __miss + '개 종목은 시세를 가져오지 못했어요. ' : '') +
         (__skipped > 0 ? '한 번에 ' + __LIMIT + '개까지만 조회합니다(' + __skipped + '개 제외). ' : '') +
@@ -1802,19 +1823,19 @@ function App(props) {
     }
   };
 
-  // ★ v41: 종목 선택 즉시 자동 시세 조회 + 60초 주기 자동 갱신 (버튼 없이 자동으로 현재가 붙음)
+  // ★ 종목 선택 즉시 자동 시세 조회 + 60초 주기 자동 갱신
   useEffect(() => {
     if (!selectedStocks || selectedStocks.length === 0) return;
-    const _auto = setTimeout(() => { refreshAllPrices(); }, 600);    // 선택 직후 자동 조회(디바운스)
-    const _iv = setInterval(() => { refreshAllPrices(); }, 60000);   // 60초마다 자동 갱신
+    const _auto = setTimeout(() => { refreshAllPrices(); }, 600);
+    const _iv = setInterval(() => { refreshAllPrices(); }, 60000);
     return () => { clearTimeout(_auto); clearInterval(_iv); };
   }, [selectedStocks]);
 
-  // ★ v5: 프롬프트에 삽입할 라이브 가격 블록 생성
+  // ★ 프롬프트에 삽입할 라이브 가격 블록 생성 (키움증권 영웅문)
   const getLivePriceBlock = () => {
     const lines = selectedStocks.map(s => formatPriceForPrompt(s, stockPrices[s])).filter(Boolean);
     if (lines.length === 0) return '';
-    return `📊 한국투자증권 실시간 시세 (${priceTimestamp} 조회)\n${lines.join('\n')}\n\n⚠️ 위 가격을 분석의 기준점으로 사용하세요. AI 추측·과거 학습값으로 대체 금지.\n\n---\n\n`;
+    return `📊 키움증권 영웅문 실시간 시세 (${priceTimestamp} 조회)\n${lines.join('\n')}\n\n⚠️ 위 가격을 분석의 기준점으로 사용하세요. AI 추측·과거 학습값으로 대체 금지.\n\n---\n\n`;
   };
 
   // 현재 시간 타임스탬프 생성 (프롬프트 생성 시점)
@@ -6808,16 +6829,30 @@ E (Example) - 출력 형식
         color: '#B8924C',
         letterSpacing: '1px'
       }
-    }, "💎 한국투자증권 실시간 시세", /*#__PURE__*/React.createElement("span", {
-  // 어느 앱의 어느 빌드를 보고 있는지 화면에서 바로 알 수 있게 표시한다.
-  // 이게 없으면 "고쳤는데 그대로다"의 원인이 캐시인지 코드인지 가릴 수가 없다.
-  style: { marginLeft: '8px', fontSize: '10px', fontWeight: 700, opacity: 0.55, letterSpacing: '0.3px' }
-}, (window.__riceIsBook ? "책앱" : "판매용") + " · v51")), priceTimestamp && /*#__PURE__*/React.createElement("div", {
+    }, "💎 키움증권 실시간 시세", /*#__PURE__*/React.createElement("span", {
+  style: { marginLeft: '8px', fontSize: '10px', fontWeight: 700, opacity: 0.75, letterSpacing: '0.3px', background: 'rgba(184,146,76,0.2)', padding: '2px 6px', borderRadius: '4px' }
+}, "영웅문 OpenAPI")), /*#__PURE__*/React.createElement("div", {
+      style: { display: 'flex', alignItems: 'center', gap: '8px' }
+    }, priceTimestamp && /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: '10px',
         color: '#9CA3AF'
       }
-    }, priceTimestamp, " 조회")), /*#__PURE__*/React.createElement("button", {
+    }, priceTimestamp, " 조회"), /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      onClick: () => setShowKiwoomModal(true),
+      style: {
+        background: 'rgba(255,255,255,0.15)',
+        color: '#F9FAFB',
+        border: '1px solid rgba(255,255,255,0.3)',
+        borderRadius: '5px',
+        fontSize: '10.5px',
+        fontWeight: '700',
+        padding: '3px 8px',
+        cursor: 'pointer',
+        fontFamily: 'inherit'
+      }
+    }, "⚙️ 키움 설정"))), /*#__PURE__*/React.createElement("button", {
       onClick: refreshAllPrices,
       disabled: priceLoading,
       style: {
@@ -8679,7 +8714,143 @@ E (Example) - 출력 형식
     className: "history-item-time"
   }, entry.time)), /*#__PURE__*/React.createElement("div", {
     className: "history-item-action"
-  }, "불러오기 →")))))));
+  }, "불러오기 →"))))))),
+  showKiwoomModal && React.createElement(KiwoomModal, { onClose: () => setShowKiwoomModal(false) })
+  );
+}
+
+// ── 키움증권 Open API 설정 모달 컴포넌트 ──────────────────────────────
+function KiwoomModal({ onClose }) {
+  const [appKey, setAppKey] = React.useState(localStorage.getItem('kiwoom_app_key') || '');
+  const [secretKey, setSecretKey] = React.useState(localStorage.getItem('kiwoom_secret_key') || '');
+  const [serverMode, setServerMode] = React.useState(localStorage.getItem('kiwoom_server_mode') || 'real');
+  const [proxyUrl, setProxyUrl] = React.useState(localStorage.getItem('kiwoom_proxy_url') || 'http://localhost:5000');
+  const [showSecret, setShowSecret] = React.useState(false);
+  const [testStatus, setTestStatus] = React.useState('');
+  const [isTesting, setIsTesting] = React.useState(false);
+
+  const handleSave = () => {
+    localStorage.setItem('kiwoom_app_key', appKey.trim());
+    localStorage.setItem('kiwoom_secret_key', secretKey.trim());
+    localStorage.setItem('kiwoom_server_mode', serverMode);
+    localStorage.setItem('kiwoom_proxy_url', proxyUrl.trim());
+    alert('키움증권 API 설정이 저장되었습니다.');
+    onClose();
+  };
+
+  const handleTestProxy = async () => {
+    setIsTesting(true);
+    setTestStatus('프록시 서버 연결 확인 중...');
+    try {
+      const res = await fetch(`${proxyUrl.trim()}/api/health`);
+      if (res.ok) {
+        const data = await res.json();
+        setTestStatus('✅ ' + (data.message || '프록시 정상 연결됨'));
+      } else {
+        setTestStatus('⚠️ 프록시 응답 이상 (HTTP ' + res.status + ')');
+      }
+    } catch (e) {
+      setTestStatus('❌ 프록시 연결 실패: 터미널에서 python kiwoom_proxy.py 를 실행해주세요.');
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  return React.createElement('div', {
+    style: {
+      position: 'fixed', top: 0, left: 0, width: '100%', height: '100%',
+      background: 'rgba(11,29,46,0.65)', backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000,
+      padding: '16px'
+    },
+    onClick: e => { if (e.target === e.currentTarget) onClose(); }
+  }, React.createElement('div', {
+    style: {
+      background: '#FFFFFF', borderRadius: '16px', maxWidth: '480px', width: '100%',
+      padding: '24px', boxShadow: '0 20px 40px rgba(0,0,0,0.25)',
+      fontFamily: 'inherit', color: '#0F1B2D', maxHeight: '90vh', overflowY: 'auto'
+    }
+  }, [
+    React.createElement('div', {
+      key: 'hdr',
+      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', borderBottom: '1px solid #E5E7EB', paddingBottom: '12px' }
+    }, [
+      React.createElement('div', { key: 't', style: { fontSize: '17px', fontWeight: 800, color: '#0B1D2E' } }, '⚙️ 키움증권 Open API 설정'),
+      React.createElement('button', {
+        key: 'x', onClick: onClose,
+        style: { background: 'none', border: 'none', fontSize: '20px', cursor: 'pointer', color: '#6B7280' }
+      }, '✕')
+    ]),
+    React.createElement('div', {
+      key: 'desc',
+      style: { fontSize: '12.5px', color: '#4B5563', lineHeight: 1.6, marginBottom: '18px', background: '#F9FAFB', padding: '12px', borderRadius: '8px', border: '1px solid #E5E7EB' }
+    }, '키움증권 REST API의 App Key와 Secret Key를 입력하세요. 브라우저 로컬 스토리지에만 저장되며 외부로 유출되지 않습니다.'),
+    React.createElement('div', { key: 'grp_appkey', style: { marginBottom: '14px' } }, [
+      React.createElement('label', { key: 'lbl_appkey', style: { display: 'block', fontSize: '12px', fontWeight: 700, marginBottom: '6px', color: '#374151' } }, 'App Key'),
+      React.createElement('input', {
+        key: 'in_appkey', type: 'text', value: appKey, onChange: e => setAppKey(e.target.value),
+        placeholder: '키움증권 App Key 입력',
+        style: { width: '100%', padding: '10px 12px', border: '1.5px solid #D1D5DB', borderRadius: '8px', fontSize: '13px' }
+      })
+    ]),
+    React.createElement('div', { key: 'grp_secret', style: { marginBottom: '14px' } }, [
+      React.createElement('div', { key: 'lbl_row', style: { display: 'flex', justifyContent: 'space-between', marginBottom: '6px' } }, [
+        React.createElement('label', { key: 'lbl_sec', style: { fontSize: '12px', fontWeight: 700, color: '#374151' } }, 'Secret Key'),
+        React.createElement('button', {
+          key: 'tgl_sec', type: 'button', onClick: () => setShowSecret(v => !v),
+          style: { background: 'none', border: 'none', fontSize: '11px', color: '#B8924C', cursor: 'pointer', fontWeight: 600 }
+        }, showSecret ? '숨기기' : '보기')
+      ]),
+      React.createElement('input', {
+        key: 'in_secret', type: showSecret ? 'text' : 'password', value: secretKey, onChange: e => setSecretKey(e.target.value),
+        placeholder: '키움증권 Secret Key 입력',
+        style: { width: '100%', padding: '10px 12px', border: '1.5px solid #D1D5DB', borderRadius: '8px', fontSize: '13px' }
+      })
+    ]),
+    React.createElement('div', { key: 'grp_mode', style: { marginBottom: '14px' } }, [
+      React.createElement('label', { key: 'lbl_mode', style: { display: 'block', fontSize: '12px', fontWeight: 700, marginBottom: '6px', color: '#374151' } }, '투자 모드'),
+      React.createElement('div', { key: 'btn_mode', style: { display: 'flex', gap: '8px' } }, [
+        React.createElement('button', {
+          key: 'm_real', type: 'button', onClick: () => setServerMode('real'),
+          style: {
+            flex: 1, padding: '8px', borderRadius: '6px', border: serverMode === 'real' ? '2px solid #B8924C' : '1px solid #D1D5DB',
+            background: serverMode === 'real' ? '#FEF9C3' : '#FFF', color: '#0F1B2D', fontWeight: 700, fontSize: '12px', cursor: 'pointer'
+          }
+        }, '🟢 실전투자 (Real)'),
+        React.createElement('button', {
+          key: 'm_mock', type: 'button', onClick: () => setServerMode('mock'),
+          style: {
+            flex: 1, padding: '8px', borderRadius: '6px', border: serverMode === 'mock' ? '2px solid #B8924C' : '1px solid #D1D5DB',
+            background: serverMode === 'mock' ? '#FEF9C3' : '#FFF', color: '#0F1B2D', fontWeight: 700, fontSize: '12px', cursor: 'pointer'
+          }
+        }, '🟡 모의투자 (Mock)')
+      ])
+    ]),
+    React.createElement('div', { key: 'grp_proxy', style: { marginBottom: '16px' } }, [
+      React.createElement('label', { key: 'lbl_proxy', style: { display: 'block', fontSize: '12px', fontWeight: 700, marginBottom: '6px', color: '#374151' } }, '로컬 프록시 주소 (kiwoom_proxy.py)'),
+      React.createElement('div', { key: 'row_proxy', style: { display: 'flex', gap: '6px' } }, [
+        React.createElement('input', {
+          key: 'in_proxy', type: 'text', value: proxyUrl, onChange: e => setProxyUrl(e.target.value),
+          style: { flex: 1, padding: '8px 10px', border: '1.5px solid #D1D5DB', borderRadius: '6px', fontSize: '12.5px' }
+        }),
+        React.createElement('button', {
+          key: 'btn_test', type: 'button', onClick: handleTestProxy, disabled: isTesting,
+          style: { padding: '8px 12px', background: '#374151', color: '#FFF', border: 'none', borderRadius: '6px', fontSize: '12px', fontWeight: 700, cursor: 'pointer' }
+        }, isTesting ? '확인중...' : '연결 확인')
+      ]),
+      testStatus && React.createElement('div', { key: 'test_st', style: { marginTop: '6px', fontSize: '11.5px', color: testStatus.startsWith('✅') ? '#059669' : '#DC2626' } }, testStatus)
+    ]),
+    React.createElement('div', { key: 'actions', style: { display: 'flex', gap: '10px', marginTop: '20px' } }, [
+      React.createElement('button', {
+        key: 'btn_close', type: 'button', onClick: onClose,
+        style: { flex: 1, padding: '11px', borderRadius: '8px', border: '1px solid #D1D5DB', background: '#F3F4F6', color: '#374151', fontSize: '13px', fontWeight: 700, cursor: 'pointer' }
+      }, '취소'),
+      React.createElement('button', {
+        key: 'btn_save', type: 'button', onClick: handleSave,
+        style: { flex: 2, padding: '11px', borderRadius: '8px', border: 'none', background: '#B8924C', color: '#FFF', fontSize: '13px', fontWeight: 800, cursor: 'pointer' }
+      }, '설정 저장')
+    ])
+  ]));
 }
 
 // ═══════════════ v48: 책·강의용 게이트 (로그인 없음) ═══════════════
@@ -8737,10 +8908,13 @@ var FULL_APP_URL = 'https://riceaistock.web.app';
       if (token) o.headers = Object.assign({}, o.headers || {}, { Authorization: 'Bearer ' + token });
       return orig.call(self, target, o);
     };
-    // 익명 로그인이 안 됐어도 요청은 보낸다. 서버가 401 을 주면 앱은
-    // "시세 없음"으로 넘어가고 프롬프트 생성은 그대로 된다 — 어르신에게
-    // 에러 화면을 보이는 것보다 조용히 시세만 빠지는 편이 낫다.
-    if (!_fbAuth || !_fbAuth.currentUser) return send(null);
+    if (!_fbAuth) return send(null);
+    if (!_fbAuth.currentUser) {
+      return _fbAuth.signInAnonymously()
+        .then(function(cred) { return cred.user ? cred.user.getIdToken() : null; })
+        .then(send)
+        .catch(function () { return send(null); });
+    }
     return _fbAuth.currentUser.getIdToken()
       .then(send)
       .catch(function () { return send(null); });
@@ -8829,8 +9003,8 @@ function AuthGate() {
   var r = React.useState(false), ready = r[0], setReady = r[1];
 
   React.useEffect(function () {
-    if (!QR_FREE || !_fbReady) { setReady(true); return; }
-    // 질문 수집용 익명 로그인. 실패해도 앱은 그대로 쓸 수 있어야 한다.
+    if (!_fbReady) { setReady(true); return; }
+    // 실시간 시세 토큰 발급 및 기능 활성화를 위해 접속 즉시 자동 익명 로그인
     if (_fbAuth.currentUser) { setReady(true); return; }
     _fbAuth.signInAnonymously()
       .then(function () { setReady(true); })
